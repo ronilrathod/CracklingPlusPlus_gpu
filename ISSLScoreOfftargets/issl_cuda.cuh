@@ -8,17 +8,22 @@ void gpu_popcount_hamming(const uint64_t* h_a, const uint64_t* h_b, int n, int* 
 // 2) GPU sequence -> signature (20-mer) encoder; copies back to host buffer
 void gpu_encode_sequences(const char* h_buf, int n, int seqLineLength, uint64_t* h_out);
 
-// 3) Baseline GPU scoring inner loop (distance only, dist<=maxDist)
-//    Returns a compact vector of candidate hits to be scored on CPU:
-//       (queryIdx, signatureId, occurrences, mismatchesMask)
+// 3) Hit structure returned by GPU distance stage
 struct Hit { int q; uint32_t id; uint32_t occ; uint64_t mismatches; };
-void gpu_scan_slices_distance_only(
-    const uint64_t* h_querySignatures, int queryCount,
-    const uint64_t* h_offtargets, int offtargetsCount,
-    const size_t*    h_allSlicelistSizes,  // length = sum over slices of 4^(sliceLen)
-    uint64_t* const* h_sliceListPtrs,      // per-slice array of pointers into allSignatures
-    const int*       h_sliceLens,          // per-slice length in positions (e.g., 5,6,...)
-    const uint64_t*  h_slicePosIdx,        // flattened [sum over slices of sliceLen] positions
-    int sliceCount,
+
+// 4) GPU distance-only scan using *flat* metadata (no host pointers)
+//    Produces compact hits (q, id, occ, mismatches) with dist <= maxDist.
+void gpu_distance_scan_flat(
+    const std::vector<uint64_t>& querySigs,
+    const std::vector<uint64_t>& offtargets,
+    const std::vector<uint64_t>& allSignatures,      // packed [occ:32|id:32]
+    const std::vector<size_t>&   allSlicelistSizes,  // concatenated per-slice sublist sizes
+    const std::vector<int>&      sliceLen,           // per slice
+    const std::vector<size_t>&   sliceSizesOffset,   // per slice: index into allSlicelistSizes
+    const std::vector<size_t>&   sliceBaseOffset,    // per slice: base offset into allSignatures
+    const std::vector<uint32_t>& prefixFlat,         // concatenated prefix sums per slice
+    const std::vector<size_t>&   prefixOffset,       // per slice: start index into prefixFlat
+    const std::vector<uint64_t>& posIdxFlat,         // concatenated positions (from sliceMasks)
+    const std::vector<size_t>&   posOffset,          // per slice: start index into posIdxFlat
     int maxDist,
-    std::vector<Hit>& out_hits);           // filled on host
+    std::vector<Hit>& out_hits);
