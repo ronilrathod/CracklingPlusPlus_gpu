@@ -304,6 +304,7 @@ int main(int argc, char **argv) {
     counter.store(0);
   }
 
+// Main omp 2 (Scoring loop)
 #pragma omp parallel
   {
     vector<uint64_t> offtargetToggles(numOfftargetToggles);
