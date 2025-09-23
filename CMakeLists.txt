@@ -1,6 +1,8 @@
 ﻿# CMakeList.txt : Main CMake file for CracklingPlusPlus
 cmake_minimum_required (VERSION 3.8)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Project name, version and description
 project ("CracklingPlusPlus" LANGUAGES CXX C VERSION 1.0.0 DESCRIPTION "C++ version of Crackling" )
 
@@ -18,6 +20,7 @@ add_subdirectory (${CMAKE_SOURCE_DIR}/lib)
 
 # Boost
 find_package(Boost REQUIRED COMPONENTS regex iostreams)
+include_directories("C:/local/boost_1_88_0")
 
 # Add source to this project's executable.
 add_executable (${PROJECT_NAME} ${CMAKE_SOURCE_DIR}/src/CracklingPlusPlus.cpp)

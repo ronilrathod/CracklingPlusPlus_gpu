@@ -60,7 +60,7 @@ int main(int argc, char** argv)
 
     std::cout << "Spliting input(s)" << std::endl;
     // Split each sequence to it's own file
-    #pragma omp parallel for schedule(static,1)
+    // #pragma omp parallel for schedule(static,1)
     for (const string& file : filesToProcess)
     {
         ofstream tempOutFile;
@@ -110,7 +110,7 @@ int main(int argc, char** argv)
     // Mulithread process each extacts off targets
     std::atomic_ullong batchFileCounter = 0;
     uint64_t offTargetBatchSize = 30000000;
-    #pragma omp parallel for schedule(static,1)
+    // #pragma omp parallel for schedule(static,1)
     for (int i = 0; i < inputFileCounter; i++)
     {
         ofstream outFile;
@@ -165,7 +165,7 @@ int main(int argc, char** argv)
     std::cout << "Done" << std::endl;
 
     std::cout << "Sorting batch files" << std::endl;
-    #pragma omp parallel for schedule(static,1)
+    // #pragma omp parallel for schedule(static,1)
     for (int i = 0; i < batchFileCounter; i++)
     {
 
@@ -211,7 +211,7 @@ int main(int argc, char** argv)
         }
         int batchSize = ceil(batchFileCounter / (threads * 1.0));
 
-        #pragma omp parallel for schedule(static,1)
+        // #pragma omp parallel for schedule(static,1)
         for (int i = 0; i < threads; ++i)
         {
 
