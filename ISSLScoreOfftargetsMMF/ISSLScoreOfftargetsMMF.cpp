@@ -21,7 +21,7 @@ uint64_t sequenceToSignature(const std::string& seq, uint64_t seqLen)
     }
     return signature;
 }
-// test push
+
 string signatureToSequence(uint64_t sig, uint64_t seqLen)
 {
     string sequence = string(seqLen, ' ');
