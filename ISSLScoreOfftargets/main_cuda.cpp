@@ -11,9 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <climits> // for CHAR_BIT
+#include <unordered_map>
 
-#include "issl_cuda.cuh"    // Hit, gpu_encode_sequences(...), gpu_distance_scan_flat(...)
-#include "../include/otScorePenalties.hpp" // same as CPU
+#include "issl_cuda.cuh"    // Hit, gpu_encode_sequences(...), gpu_distance_scan_flat(...), gpu_dedup_by_qid(...), gpu_score_queries(...), gpu_load_cfd_tables(...)
+#include "../include/otScorePenalties.hpp" // cfdPamPenalties, cfdPosPenalties, precalculatedMITScores
 
 // --- tiny helpers (no Boost) ------------------------------------------------
 static inline std::string signatureToSequence(uint64_t sig, int seqLen)
@@ -27,11 +28,21 @@ static inline std::string signatureToSequence(uint64_t sig, int seqLen)
 }
 
 #if defined(_MSC_VER)
-#include <intrin.h>
-static inline int popcount64_host(uint64_t x) { return (int)__popcnt64(x); }
+  #include <intrin.h>
+  static inline int popcount64_host(uint64_t x) { return (int)__popcnt64(x); }
 #else
-static inline int popcount64_host(uint64_t x) { return __builtin_popcountll((unsigned long long)x); }
+  static inline int popcount64_host(uint64_t x) { return __builtin_popcountll((unsigned long long)x); }
 #endif
+
+// Map score method string to kernel enum (must match issl_cuda.cu)
+static inline int toScoreMethodEnum(const std::string& m) {
+    if (m == "and") return 0;
+    if (m == "or")  return 1;
+    if (m == "avg") return 2;
+    if (m == "mit") return 3;
+    if (m == "cfd") return 4;
+    return -1;
+}
 
 // ----------------------------------------------------------------------------
 
@@ -53,28 +64,29 @@ int main(int argc, char **argv)
     {
         std::fprintf(stderr, "[GPU] Note: clamping maxDist from %d to 4 to match CPU logic.\n", maxDistCLI);
     }
-    const double threshold = std::atof(argv[4]); // used for early-exit in reduce
-    const std::string scoreMethod = argv[5];
+    const double threshold = std::atof(argv[4]); // used for early-exit
+    const std::string scoreMethodStr = argv[5];
     const bool wantOutputName = (argc > 6);
+
+    const int scoreMethod = toScoreMethodEnum(scoreMethodStr);
+    if (scoreMethod < 0) {
+        std::fprintf(stderr, "Invalid scoring method. Acceptable: and|or|avg|mit|cfd\n");
+        return 1;
+    }
 
     // Decide which scores to compute (mirror CPU flags)
     bool calcMit = false, calcCfd = false;
-    if (scoreMethod == "and" || scoreMethod == "or" || scoreMethod == "avg")
+    if (scoreMethodStr == "and" || scoreMethodStr == "or" || scoreMethodStr == "avg")
     {
         calcMit = calcCfd = true;
     }
-    else if (scoreMethod == "mit")
+    else if (scoreMethodStr == "mit")
     {
         calcMit = true;
     }
-    else if (scoreMethod == "cfd")
+    else if (scoreMethodStr == "cfd")
     {
         calcCfd = true;
-    }
-    else
-    {
-        std::fprintf(stderr, "Invalid scoring method. Acceptable: and|or|avg|mit|cfd\n");
-        return 1;
     }
 
     // ---------------------------
@@ -247,45 +259,29 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "GPU encode done: %d guides in %.3f ms\n",
                  queryCount, std::chrono::duration<double, std::milli>(t_enc1 - t_enc0).count());
 
-    if (queryCount > 0)
-    {
-        std::printf("First signature (hex): 0x%016llx\n",
-                    (unsigned long long)querySignatures[0]);
-    }
-
-    // ---- Parity check against a tiny CPU encoder ----
+    // ---- Parity sanity (optional) ----
+    size_t mismatches = 0;
     auto cpu_encode_line = [seqLength](const char *s) -> uint64_t
     {
         auto lut = [](char c) -> uint64_t
         {
             switch (c)
             {
-            case 'C':
-                return 1;
-            case 'G':
-                return 2;
-            case 'T':
-                return 3;
-            default:
-                return 0;
+            case 'C': return 1;
+            case 'G': return 2;
+            case 'T': return 3;
+            default:  return 0;
             }
         };
         uint64_t sig = 0;
-        for (size_t j = 0; j < seqLength; ++j) // use seqLength, not 20
+        for (size_t j = 0; j < seqLength; ++j)
             sig |= (lut(s[j]) << (j * 2));
         return sig;
     };
-
-    size_t mismatches = 0;
     for (int i = 0; i < queryCount; ++i)
     {
         const char *line = &queryDataSet[i * (int)seqLineLength];
-        if (cpu_encode_line(line) != querySignatures[i])
-        {
-            ++mismatches;
-            if (mismatches < 5)
-                std::fprintf(stderr, "Encode mismatch at %d\n", i);
-        }
+        if (cpu_encode_line(line) != querySignatures[i]) ++mismatches;
     }
     std::fprintf(stderr, "Encode parity: %zu mismatches out of %d\n", mismatches, queryCount);
 
@@ -305,167 +301,57 @@ int main(int argc, char **argv)
                  hits.size(), std::chrono::duration<double, std::milli>(t_scan1 - t_scan0).count());
 
     // ---------------------------
-    // 6) CPU reduce + MIT/CFD
+    // 6) GPU dedup (q,id) + per-query offsets + distinct IDs
     // ---------------------------
-    auto t_reduce0 = std::chrono::high_resolution_clock::now();
+    auto t_dedup0 = std::chrono::high_resolution_clock::now();
+    DedupResult dd = gpu_dedup_by_qid(hits, queryCount);
+    auto t_dedup1 = std::chrono::high_resolution_clock::now();
 
-    // per-query outputs
+    // ---------------------------
+    // 7) Build MIT LUT on host (exact CPU parity)
+    // ---------------------------
+    auto t_lut0 = std::chrono::high_resolution_clock::now();
+    std::vector<uint64_t> mitMasks = dd.mism_u;
+    std::sort(mitMasks.begin(), mitMasks.end());
+    mitMasks.erase(std::unique(mitMasks.begin(), mitMasks.end()), mitMasks.end());
+
+    std::vector<double> mitVals(mitMasks.size(), 0.0);
+    if (calcMit) {
+        for (size_t i = 0; i < mitMasks.size(); ++i) {
+            auto it = precalculatedMITScores.find(mitMasks[i]);
+            mitVals[i] = (it != precalculatedMITScores.end()) ? it->second : 0.0;
+        }
+    }
+    auto t_lut1 = std::chrono::high_resolution_clock::now();
+
+    // ---------------------------
+    // 8) Load CFD tables to GPU constant memory
+    // ---------------------------
+    gpu_load_cfd_tables(cfdPamPenalties, sizeof(cfdPamPenalties)/sizeof(double),
+                        cfdPosPenalties, sizeof(cfdPosPenalties)/sizeof(double));
+
+    // ---------------------------
+    // 9) GPU scoring (per-query block; early-exit parity)
+    // ---------------------------
+    auto t_score0 = std::chrono::high_resolution_clock::now();
     std::vector<double> querySignatureMitScores(queryCount, 0.0);
     std::vector<double> querySignatureCfdScores(queryCount, 0.0);
-    std::vector<std::atomic<uint64_t>> offtargetsPerQuery(queryCount);
-    for (auto &a : offtargetsPerQuery)
-        a.store(0);
+    std::vector<uint64_t> offtargetsPerQuery(queryCount, 0);
 
-    // === Bucketize hits by query (O(H), no sort) ===
-    // Build per-query counts
-    std::vector<size_t> qCount(queryCount, 0);
-    for (const auto &h : hits)
-        ++qCount[h.q];
+    gpu_score_queries(
+        querySignatures, offtargets,
+        dd.q_u, dd.id_u, dd.occ_u, dd.mism_u, dd.qOffset,
+        mitMasks, mitVals,
+        threshold, scoreMethod,
+        calcMit, calcCfd,
+        querySignatureMitScores, querySignatureCfdScores, offtargetsPerQuery);
+    auto t_score1 = std::chrono::high_resolution_clock::now();
 
-    // Prefix offsets
-    std::vector<size_t> qOffset(queryCount + 1, 0);
-    for (int q = 0; q < queryCount; ++q)
-        qOffset[q + 1] = qOffset[q] + qCount[q];
-
-    // Scatter to buckets (stable by arrival)
-    std::vector<Hit> hitsByQ(hits.size());
-    std::vector<size_t> cursor = qOffset; // working write cursors
-    for (const auto &h : hits)
-        hitsByQ[cursor[h.q]++] = h;
-
-    // === Reduce per query (same logic as CPU) ===
-    const uint64_t numOfftargetToggles =
-        (offtargetsCount / ((size_t)sizeof(uint64_t) * (size_t)CHAR_BIT)) + 1ULL;
-
-    // Global bitmap across all queries (for the “Distinct off-targets” stat)
-    std::vector<std::atomic<uint64_t>> seenBitmap(numOfftargetToggles);
-    for (auto &w : seenBitmap)
-        w.store(0, std::memory_order_relaxed);
-
-    uint64_t totalOfftargetsScored = 0;
-
-    for (int q = 0; q < queryCount; ++q)
-    {
-        const size_t begin = qOffset[q], end = qOffset[q + 1];
-
-        // no hits for this query
-        if (begin == end)
-        {
-            querySignatureMitScores[q] = 10000.0 / (100.0 + 0.0);
-            querySignatureCfdScores[q] = 10000.0 / (100.0 + 0.0);
-            continue;
-        }
-
-        // local dedup bitmap (same shape as CPU)
-        std::vector<uint64_t> seenLocal(numOfftargetToggles, 0);
-        uint64_t *seenTail = seenLocal.data() + numOfftargetToggles - 1;
-
-        const uint64_t searchSig = querySignatures[q];
-        double totMit = 0.0, totCfd = 0.0;
-        uint64_t localOfftargetCount = 0;
-
-        // CPU early-exit threshold logic
-        const double maximum_sum = (10000.0 - threshold * 100) / threshold;
-
-        for (size_t i = begin; i < end; ++i)
-        {
-            const auto &h = hitsByQ[i];
-
-            // per-query dedup on id
-            uint64_t *word = (seenTail - (h.id / 64));
-            const uint64_t bit = 1ULL << (h.id % 64);
-            if (*word & bit)
-                continue; // already seen this id for this query
-            *word |= bit;
-
-            const int dist = popcount64_host(h.mismatches);
-            if (dist > maxDist)
-                continue;
-
-            localOfftargetCount += h.occ;
-
-            // mark globally seen to compute “Distinct off-targets”
-            const size_t gword = h.id / 64;
-            const uint64_t gbit = 1ULL << (h.id % 64);
-            seenBitmap[gword].fetch_or(gbit, std::memory_order_relaxed);
-
-            // --- MIT (same as CPU) ---
-            if (calcMit && dist > 0)
-            {
-                auto it = precalculatedMITScores.find(h.mismatches);
-                if (it != precalculatedMITScores.end())
-                    totMit += it->second * (double)h.occ;
-            }
-
-            // --- CFD (same as CPU) ---
-            if (calcCfd)
-            {
-                double cfd = 0.0;
-                if (dist == 0)
-                {
-                    cfd = 1.0;
-                }
-                else
-                {
-                    cfd = cfdPamPenalties[0b1010]; // PAM NGG (matches CPU)
-                    for (size_t pos = 0; pos < 20; ++pos)
-                    {
-                        size_t mask = pos << 4;
-                        uint64_t spos = (searchSig >> (pos * 2)) & 3ULL;
-                        spos <<= 2;
-                        uint64_t opos = (offtargets[h.id] >> (pos * 2)) & 3ULL;
-                        mask |= spos | (opos ^ 3ULL);
-                        if ((spos >> 2) != opos)
-                            cfd *= cfdPosPenalties[mask];
-                    }
-                }
-                totCfd += cfd * (double)h.occ;
-            }
-
-            // --- Early-exit (identical logic to CPU) ---
-            if (scoreMethod == "and")
-            {
-                if (totMit > maximum_sum && totCfd > maximum_sum)
-                    break;
-            }
-            else if (scoreMethod == "or")
-            {
-                if (totMit > maximum_sum || totCfd > maximum_sum)
-                    break;
-            }
-            else if (scoreMethod == "avg")
-            {
-                if (((totMit + totCfd) / 2.0) > maximum_sum)
-                    break;
-            }
-            else if (scoreMethod == "mit")
-            {
-                if (totMit > maximum_sum)
-                    break;
-            }
-            else if (scoreMethod == "cfd")
-            {
-                if (totCfd > maximum_sum)
-                    break;
-            }
-        }
-
-        offtargetsPerQuery[q].store(localOfftargetCount);
-        totalOfftargetsScored += localOfftargetCount;
-
-        querySignatureMitScores[q] = 10000.0 / (100.0 + totMit);
-        querySignatureCfdScores[q] = 10000.0 / (100.0 + totCfd);
-    }
-
-    auto t_reduce1 = std::chrono::high_resolution_clock::now();
-
-    // Distinct off-targets across all queries
-    uint64_t distinctOfftargets = 0;
-    for (const auto &w : seenBitmap)
-        distinctOfftargets += popcount64_host(w.load(std::memory_order_relaxed));
+    // Distinct off-targets across all queries (from dedup result)
+    uint64_t distinctOfftargets = dd.distinctCount;
 
     // ---------------------------
-    // 7) Write results like CPU (but under results\gpu\)
+    // 10) Write results like CPU (but under results\gpu\)
     // ---------------------------
     auto t_out0 = std::chrono::high_resolution_clock::now();
 
@@ -482,21 +368,13 @@ int main(int argc, char **argv)
     std::fprintf(out, "# Query\tMIT_Score\tCFD_Score\tOfftarget_Count\n");
     for (int q = 0; q < queryCount; ++q)
     {
-        // For exact parity with CPU, write the sequence (not just index)
         const std::string seq = signatureToSequence(querySignatures[q], (int)seqLength);
         std::fprintf(out, "%s\t", seq.c_str());
 
-        if (calcMit)
-            std::fprintf(out, "%f\t", querySignatureMitScores[q]);
-        else
-            std::fprintf(out, "-1\t");
+        if (calcMit) std::fprintf(out, "%f\t", querySignatureMitScores[q]); else std::fprintf(out, "-1\t");
+        if (calcCfd) std::fprintf(out, "%f\t", querySignatureCfdScores[q]); else std::fprintf(out, "-1\t");
 
-        if (calcCfd)
-            std::fprintf(out, "%f\t", querySignatureCfdScores[q]);
-        else
-            std::fprintf(out, "-1\t");
-
-        std::fprintf(out, "%llu\n", (unsigned long long)offtargetsPerQuery[q].load());
+        std::fprintf(out, "%llu\n", (unsigned long long)offtargetsPerQuery[q]);
     }
     std::fclose(out);
     std::fprintf(stderr, "GPU detailed results saved to: %s\n", outPath.c_str());
@@ -505,15 +383,21 @@ int main(int argc, char **argv)
     auto t_total_end = std::chrono::high_resolution_clock::now();
 
     // ---------------------------
-    // 8) Print CPU-style summary
+    // 11) Print CPU-style summary
     // ---------------------------
-    const auto ms_load = std::chrono::duration_cast<std::chrono::milliseconds>(t_load_end - t_load_start).count();
-    const auto ms_query = std::chrono::duration_cast<std::chrono::milliseconds>(t_query_end - t_query_start).count();
-    const auto ms_encode = std::chrono::duration_cast<std::chrono::milliseconds>(t_enc1 - t_enc0).count();
-    const auto ms_scan = std::chrono::duration_cast<std::chrono::milliseconds>(t_scan1 - t_scan0).count();
-    const auto ms_reduce = std::chrono::duration_cast<std::chrono::milliseconds>(t_reduce1 - t_reduce0).count();
-    const auto ms_out = std::chrono::duration_cast<std::chrono::milliseconds>(t_out1 - t_out0).count();
-    const auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(t_total_end - t_total_start).count();
+    const auto ms_load   = std::chrono::duration_cast<std::chrono::milliseconds>(t_load_end   - t_load_start).count();
+    const auto ms_query  = std::chrono::duration_cast<std::chrono::milliseconds>(t_query_end  - t_query_start).count();
+    const auto ms_encode = std::chrono::duration_cast<std::chrono::milliseconds>(t_enc1       - t_enc0).count();
+    const auto ms_scan   = std::chrono::duration_cast<std::chrono::milliseconds>(t_scan1      - t_scan0).count();
+    const auto ms_dedup  = std::chrono::duration_cast<std::chrono::milliseconds>(t_dedup1     - t_dedup0).count();
+    const auto ms_lut    = std::chrono::duration_cast<std::chrono::milliseconds>(t_lut1       - t_lut0).count();
+    const auto ms_score  = std::chrono::duration_cast<std::chrono::milliseconds>(t_score1     - t_score0).count();
+    const auto ms_out    = std::chrono::duration_cast<std::chrono::milliseconds>(t_out1       - t_out0).count();
+    const auto ms_total  = std::chrono::duration_cast<std::chrono::milliseconds>(t_total_end  - t_total_start).count();
+
+    // Total off-targets scored = sum per query counts
+    uint64_t totalOfftargetsScored = 0;
+    for (auto v : offtargetsPerQuery) totalOfftargetsScored += v;
 
     std::fprintf(stderr, "\n=== GPU EXECUTION SUMMARY ===\n");
     std::fprintf(stderr, "Total queries processed: %d\n", queryCount);
@@ -524,18 +408,11 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "Query load time: %lld ms\n", (long long)ms_query);
     std::fprintf(stderr, "Encode (GPU) time: %lld ms\n", (long long)ms_encode);
     std::fprintf(stderr, "Distance scan (GPU) time: %lld ms\n", (long long)ms_scan);
-    std::fprintf(stderr, "Reduce+Score (CPU) time: %lld ms\n", (long long)ms_reduce);
+    std::fprintf(stderr, "Dedup (GPU) time: %lld ms\n", (long long)ms_dedup);
+    std::fprintf(stderr, "MIT LUT (CPU) time: %lld ms\n", (long long)ms_lut);
+    std::fprintf(stderr, "Score (GPU) time: %lld ms\n", (long long)ms_score);
     std::fprintf(stderr, "Output time: %lld ms\n", (long long)ms_out);
     std::fprintf(stderr, "Total execution time: %lld ms\n", (long long)ms_total);
-
-    // Two helpful rates:
-    std::fprintf(stderr, "Processing rate (Reduce only): %.2f queries/sec\n",
-                 ms_reduce > 0 ? (queryCount * 1000.0) / (double)ms_reduce : 0.0);
-    std::fprintf(stderr, "Processing rate (Scan+Reduce): %.2f queries/sec\n",
-                 (ms_scan + ms_reduce) > 0 ? (queryCount * 1000.0) / (double)(ms_scan + ms_reduce) : 0.0);
-
-    std::fprintf(stderr, "Off-target scoring rate: %.2f off-targets/sec\n",
-                 ms_reduce > 0 ? (totalOfftargetsScored * 1000.0) / (double)ms_reduce : 0.0);
     std::fprintf(stderr, "Distinct off-targets: %llu\n", (unsigned long long)distinctOfftargets);
     std::fprintf(stderr, "=============================\n\n");
 
