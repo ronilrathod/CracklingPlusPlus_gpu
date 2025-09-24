@@ -1,7 +1,8 @@
+// ISSLScoreOfftargets/issl_cuda.cu
+
 #include "issl_cuda.cuh"
 #include <cuda_runtime.h>
 #include <vector>
-#include <cassert>
 #include <algorithm>
 
 // --------------------------- 1) popcount sanity ----------------------------
@@ -9,6 +10,7 @@ __global__ void k_hamming(const uint64_t* a, const uint64_t* b, int* out, int n)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __popcll(a[i] ^ b[i]);
 }
+
 void gpu_popcount_hamming(const uint64_t* h_a, const uint64_t* h_b, int n, int* h_out){
     uint64_t *d_a=nullptr,*d_b=nullptr; int* d_out=nullptr;
     cudaMalloc(&d_a, n*sizeof(uint64_t));
@@ -28,24 +30,26 @@ __device__ __forceinline__ uint8_t nuc_lut(char c){
     // CPU mapping: A=0, C=1, G=2, T=3; everything else 0
     switch(c){ case 'C': return 1; case 'G': return 2; case 'T': return 3; default: return 0; }
 }
-__global__ void k_encode(const char* buf, int stride, uint64_t* sigs, int n){
+
+__global__ void k_encode(const char* buf, int stride, int seqlen, uint64_t* sigs, int n){
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const char* s = buf + i*stride;
     uint64_t sig = 0;
     #pragma unroll
-    for (int j=0; j<20; ++j){
+    for (int j=0; j<seqlen; ++j){
         sig |= (uint64_t)nuc_lut(s[j]) << (j*2);
     }
     sigs[i] = sig;
 }
-void gpu_encode_sequences(const char* h_buf, int n, int stride, uint64_t* h_out){
+
+void gpu_encode_sequences(const char* h_buf, int n, int stride, int seqlen, uint64_t* h_out){
     char* d_buf=nullptr; uint64_t* d_out=nullptr;
     cudaMalloc(&d_buf, (size_t)n*stride);
     cudaMalloc(&d_out, n*sizeof(uint64_t));
     cudaMemcpy(d_buf, h_buf, (size_t)n*stride, cudaMemcpyHostToDevice);
     dim3 blk(256), grd((n+blk.x-1)/blk.x);
-    k_encode<<<grd,blk>>>(d_buf, stride, d_out, n);
+    k_encode<<<grd,blk>>>(d_buf, stride, seqlen, d_out, n);
     cudaDeviceSynchronize();
     cudaMemcpy(h_out, d_out, n*sizeof(uint64_t), cudaMemcpyDeviceToHost);
     cudaFree(d_buf); cudaFree(d_out);
@@ -214,7 +218,6 @@ void gpu_distance_scan_flat(
             } else {
                 // overflow: grow and retry
                 capacity = capacity * 2;
-                // loop repeats with larger buffers
             }
         }
 

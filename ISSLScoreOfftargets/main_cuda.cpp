@@ -13,7 +13,7 @@
 #include <climits> // for CHAR_BIT
 
 #include "issl_cuda.cuh"    // Hit, gpu_encode_sequences(...), gpu_distance_scan_flat(...)
-#include "ot_penalties.hpp" // precalculatedMITScores, cfdPamPenalties, cfdPosPenalties
+#include "../include/otScorePenalties.hpp" // same as CPU
 
 // --- tiny helpers (no Boost) ------------------------------------------------
 static inline std::string signatureToSequence(uint64_t sig, int seqLen)
@@ -242,7 +242,7 @@ int main(int argc, char **argv)
     // ---------------------------
     std::vector<uint64_t> querySignatures(queryCount);
     auto t_enc0 = std::chrono::high_resolution_clock::now();
-    gpu_encode_sequences(queryDataSet.data(), queryCount, (int)seqLineLength, querySignatures.data());
+    gpu_encode_sequences(queryDataSet.data(), queryCount, (int)seqLineLength, (int)seqLength, querySignatures.data());
     auto t_enc1 = std::chrono::high_resolution_clock::now();
     std::fprintf(stderr, "GPU encode done: %d guides in %.3f ms\n",
                  queryCount, std::chrono::duration<double, std::milli>(t_enc1 - t_enc0).count());
