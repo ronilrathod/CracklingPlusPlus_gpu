@@ -13,7 +13,7 @@
 #include <climits> // for CHAR_BIT
 #include <unordered_map>
 
-#include "issl_cuda.cuh"    // Hit, gpu_encode_sequences(...), gpu_distance_scan_flat(...), gpu_dedup_by_qid(...), gpu_score_queries(...), gpu_load_cfd_tables(...)
+#include "issl_cuda.cuh"                   // Hit, gpu_encode_sequences(...), gpu_distance_scan_flat(...), gpu_dedup_by_qid(...), gpu_score_queries(...), gpu_load_cfd_tables(...)
 #include "../include/otScorePenalties.hpp" // cfdPamPenalties, cfdPosPenalties, precalculatedMITScores
 
 // --- tiny helpers (no Boost) ------------------------------------------------
@@ -28,19 +28,25 @@ static inline std::string signatureToSequence(uint64_t sig, int seqLen)
 }
 
 #if defined(_MSC_VER)
-  #include <intrin.h>
-  static inline int popcount64_host(uint64_t x) { return (int)__popcnt64(x); }
+#include <intrin.h>
+static inline int popcount64_host(uint64_t x) { return (int)__popcnt64(x); }
 #else
-  static inline int popcount64_host(uint64_t x) { return __builtin_popcountll((unsigned long long)x); }
+static inline int popcount64_host(uint64_t x) { return __builtin_popcountll((unsigned long long)x); }
 #endif
 
 // Map score method string to kernel enum (must match issl_cuda.cu)
-static inline int toScoreMethodEnum(const std::string& m) {
-    if (m == "and") return 0;
-    if (m == "or")  return 1;
-    if (m == "avg") return 2;
-    if (m == "mit") return 3;
-    if (m == "cfd") return 4;
+static inline int toScoreMethodEnum(const std::string &m)
+{
+    if (m == "and")
+        return 0;
+    if (m == "or")
+        return 1;
+    if (m == "avg")
+        return 2;
+    if (m == "mit")
+        return 3;
+    if (m == "cfd")
+        return 4;
     return -1;
 }
 
@@ -69,7 +75,8 @@ int main(int argc, char **argv)
     const bool wantOutputName = (argc > 6);
 
     const int scoreMethod = toScoreMethodEnum(scoreMethodStr);
-    if (scoreMethod < 0) {
+    if (scoreMethod < 0)
+    {
         std::fprintf(stderr, "Invalid scoring method. Acceptable: and|or|avg|mit|cfd\n");
         return 1;
     }
@@ -267,10 +274,14 @@ int main(int argc, char **argv)
         {
             switch (c)
             {
-            case 'C': return 1;
-            case 'G': return 2;
-            case 'T': return 3;
-            default:  return 0;
+            case 'C':
+                return 1;
+            case 'G':
+                return 2;
+            case 'T':
+                return 3;
+            default:
+                return 0;
             }
         };
         uint64_t sig = 0;
@@ -281,7 +292,8 @@ int main(int argc, char **argv)
     for (int i = 0; i < queryCount; ++i)
     {
         const char *line = &queryDataSet[i * (int)seqLineLength];
-        if (cpu_encode_line(line) != querySignatures[i]) ++mismatches;
+        if (cpu_encode_line(line) != querySignatures[i])
+            ++mismatches;
     }
     std::fprintf(stderr, "Encode parity: %zu mismatches out of %d\n", mismatches, queryCount);
 
@@ -290,7 +302,7 @@ int main(int argc, char **argv)
     // ---------------------------
     auto t_scan0 = std::chrono::high_resolution_clock::now();
     std::vector<Hit> hits;
-    gpu_distance_scan_flat(
+    gpu_distance_scan_by_slice_buffered(
         querySignatures, offtargets, allSignatures, allSlicelistSizes,
         h_sliceLen, h_sliceSizesOffset, h_sliceBaseOffset,
         h_prefix_flat, h_prefixOffset,
@@ -316,8 +328,10 @@ int main(int argc, char **argv)
     mitMasks.erase(std::unique(mitMasks.begin(), mitMasks.end()), mitMasks.end());
 
     std::vector<double> mitVals(mitMasks.size(), 0.0);
-    if (calcMit) {
-        for (size_t i = 0; i < mitMasks.size(); ++i) {
+    if (calcMit)
+    {
+        for (size_t i = 0; i < mitMasks.size(); ++i)
+        {
             auto it = precalculatedMITScores.find(mitMasks[i]);
             mitVals[i] = (it != precalculatedMITScores.end()) ? it->second : 0.0;
         }
@@ -327,8 +341,8 @@ int main(int argc, char **argv)
     // ---------------------------
     // 8) Load CFD tables to GPU constant memory
     // ---------------------------
-    gpu_load_cfd_tables(cfdPamPenalties, sizeof(cfdPamPenalties)/sizeof(double),
-                        cfdPosPenalties, sizeof(cfdPosPenalties)/sizeof(double));
+    gpu_load_cfd_tables(cfdPamPenalties, sizeof(cfdPamPenalties) / sizeof(double),
+                        cfdPosPenalties, sizeof(cfdPosPenalties) / sizeof(double));
 
     // ---------------------------
     // 9) GPU scoring (per-query block; early-exit parity)
@@ -371,8 +385,14 @@ int main(int argc, char **argv)
         const std::string seq = signatureToSequence(querySignatures[q], (int)seqLength);
         std::fprintf(out, "%s\t", seq.c_str());
 
-        if (calcMit) std::fprintf(out, "%f\t", querySignatureMitScores[q]); else std::fprintf(out, "-1\t");
-        if (calcCfd) std::fprintf(out, "%f\t", querySignatureCfdScores[q]); else std::fprintf(out, "-1\t");
+        if (calcMit)
+            std::fprintf(out, "%f\t", querySignatureMitScores[q]);
+        else
+            std::fprintf(out, "-1\t");
+        if (calcCfd)
+            std::fprintf(out, "%f\t", querySignatureCfdScores[q]);
+        else
+            std::fprintf(out, "-1\t");
 
         std::fprintf(out, "%llu\n", (unsigned long long)offtargetsPerQuery[q]);
     }
@@ -385,19 +405,20 @@ int main(int argc, char **argv)
     // ---------------------------
     // 11) Print CPU-style summary
     // ---------------------------
-    const auto ms_load   = std::chrono::duration_cast<std::chrono::milliseconds>(t_load_end   - t_load_start).count();
-    const auto ms_query  = std::chrono::duration_cast<std::chrono::milliseconds>(t_query_end  - t_query_start).count();
-    const auto ms_encode = std::chrono::duration_cast<std::chrono::milliseconds>(t_enc1       - t_enc0).count();
-    const auto ms_scan   = std::chrono::duration_cast<std::chrono::milliseconds>(t_scan1      - t_scan0).count();
-    const auto ms_dedup  = std::chrono::duration_cast<std::chrono::milliseconds>(t_dedup1     - t_dedup0).count();
-    const auto ms_lut    = std::chrono::duration_cast<std::chrono::milliseconds>(t_lut1       - t_lut0).count();
-    const auto ms_score  = std::chrono::duration_cast<std::chrono::milliseconds>(t_score1     - t_score0).count();
-    const auto ms_out    = std::chrono::duration_cast<std::chrono::milliseconds>(t_out1       - t_out0).count();
-    const auto ms_total  = std::chrono::duration_cast<std::chrono::milliseconds>(t_total_end  - t_total_start).count();
+    const auto ms_load = std::chrono::duration_cast<std::chrono::milliseconds>(t_load_end - t_load_start).count();
+    const auto ms_query = std::chrono::duration_cast<std::chrono::milliseconds>(t_query_end - t_query_start).count();
+    const auto ms_encode = std::chrono::duration_cast<std::chrono::milliseconds>(t_enc1 - t_enc0).count();
+    const auto ms_scan = std::chrono::duration_cast<std::chrono::milliseconds>(t_scan1 - t_scan0).count();
+    const auto ms_dedup = std::chrono::duration_cast<std::chrono::milliseconds>(t_dedup1 - t_dedup0).count();
+    const auto ms_lut = std::chrono::duration_cast<std::chrono::milliseconds>(t_lut1 - t_lut0).count();
+    const auto ms_score = std::chrono::duration_cast<std::chrono::milliseconds>(t_score1 - t_score0).count();
+    const auto ms_out = std::chrono::duration_cast<std::chrono::milliseconds>(t_out1 - t_out0).count();
+    const auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(t_total_end - t_total_start).count();
 
     // Total off-targets scored = sum per query counts
     uint64_t totalOfftargetsScored = 0;
-    for (auto v : offtargetsPerQuery) totalOfftargetsScored += v;
+    for (auto v : offtargetsPerQuery)
+        totalOfftargetsScored += v;
 
     std::fprintf(stderr, "\n=== GPU EXECUTION SUMMARY ===\n");
     std::fprintf(stderr, "Total queries processed: %d\n", queryCount);

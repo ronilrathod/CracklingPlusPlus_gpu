@@ -66,3 +66,20 @@ void gpu_score_queries(
     double threshold, int scoreMethod,
     bool calcMit, bool calcCfd,
     std::vector<double>& outMIT, std::vector<double>& outCFD, std::vector<uint64_t>& outCount);
+
+    void gpu_distance_scan_by_slice_buffered(
+    const std::vector<uint64_t>& querySigs,
+    const std::vector<uint64_t>& offtargets,
+    const std::vector<uint64_t>& allSignatures,   // packed [occ:32|id:32]
+    const std::vector<size_t>&   allSlicelistSizes,
+    const std::vector<int>&      sliceLen,
+    const std::vector<size_t>&   sliceSizesOffset,
+    const std::vector<size_t>&   sliceBaseOffset,
+    const std::vector<uint32_t>& prefixFlat,
+    const std::vector<size_t>&   prefixOffset,
+    const std::vector<uint64_t>& posIdxFlat,
+    const std::vector<size_t>&   posOffset,
+    int maxDist,
+    std::vector<Hit>& out_hits);
+
+    

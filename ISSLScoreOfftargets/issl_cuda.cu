@@ -90,22 +90,17 @@ __device__ __forceinline__ uint8_t nuc_lut(char c)
     // CPU mapping: A=0, C=1, G=2, T=3; everything else 0
     switch (c)
     {
-    case 'C':
-        return 1;
-    case 'G':
-        return 2;
-    case 'T':
-        return 3;
-    default:
-        return 0;
+    case 'C': return 1;
+    case 'G': return 2;
+    case 'T': return 3;
+    default:  return 0;
     }
 }
 
 __global__ void k_encode(const char *buf, int stride, int seqlen, uint64_t *sigs, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n)
-        return;
+    if (i >= n) return;
     const char *s = buf + i * stride;
     uint64_t sig = 0;
 #pragma unroll
@@ -132,7 +127,7 @@ void gpu_encode_sequences(const char *h_buf, int n, int stride, int seqlen, uint
     CUDA_OK(cudaFree(d_out));
 }
 
-// ---------------------- 3) distance scan (flat metadata) -------------------
+// ---------------------- 3) distance scan (old atomic version; kept intact) -
 __global__ void k_distance_scan(
     const uint64_t *__restrict__ d_querySigs, int queryCount,
     const uint64_t *__restrict__ d_offtargets,
@@ -150,8 +145,7 @@ __global__ void k_distance_scan(
     int4 *d_hits, uint64_t *d_mismatches)
 {
     int q = blockIdx.x * blockDim.x + threadIdx.x;
-    if (q >= queryCount)
-        return;
+    if (q >= queryCount) return;
 
     const uint64_t qsig = d_querySigs[q];
 
@@ -165,8 +159,7 @@ __global__ void k_distance_scan(
 #pragma unroll
         for (int j = 0; j < 32; ++j)
         {
-            if (j >= L)
-                break;
+            if (j >= L) break;
             const uint64_t p = pos[j];
             sub |= ((qsig >> (p * 2)) & 3ULL) << (j * 2);
         }
@@ -181,7 +174,7 @@ __global__ void k_distance_scan(
         for (size_t t = 0; t < count; ++t)
         {
             const uint64_t packed = ptr[t];
-            const uint32_t id = (uint32_t)(packed & 0xFFFFFFFFULL);
+            const uint32_t id  = (uint32_t)(packed & 0xFFFFFFFFULL);
             const uint32_t occ = (uint32_t)(packed >> 32);
 
             const uint64_t x = qsig ^ d_offtargets[id];
@@ -246,7 +239,7 @@ void gpu_distance_scan_flat(
     CUDA_OK(cudaMemcpy(dPos, posIdxFlat.data(), posIdxFlat.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(dPosOff, posOffset.data(), posOffset.size() * sizeof(size_t), cudaMemcpyHostToDevice));
 
-    const int BATCH = 10000; // 4070 Ti has plenty of SMs
+    const int BATCH = 10000; // legacy path
     out_hits.clear();
     out_hits.reserve(Q * 64);
 
@@ -325,6 +318,250 @@ void gpu_distance_scan_flat(
     CUDA_OK(cudaFree(dPosOff));
 }
 
+// ---------------------- 3b) NEW distance scan: by-slice, no atomics --------
+// Per-slice COUNT kernel: one thread per query, returns hits per query (for this slice)
+__global__ void k_distance_count_slice(
+    const uint64_t *__restrict__ d_querySigs, int queryCount,
+    const uint64_t *__restrict__ d_offtargets,
+    const uint64_t *__restrict__ d_allSignatures,           // full table
+    const size_t   *__restrict__ d_allSlicelistSizes_slice, // sizes for this slice only
+    const uint32_t *__restrict__ d_prefixFlat_slice,        // prefix for this slice only
+    const uint64_t *__restrict__ d_posIdx_slice,            // positions (len L)
+    int L, size_t sliceBaseOffset, int maxDist,
+    int * __restrict__ d_counts)
+{
+    int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= queryCount) return;
+
+    const uint64_t qsig = d_querySigs[q];
+
+    // Build sub-code
+    uint64_t sub = 0ULL;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        if (j >= L) break;
+        const uint64_t p = d_posIdx_slice[j];
+        sub |= ((qsig >> (p * 2)) & 3ULL) << (j * 2);
+    }
+
+    const size_t cnt   = d_allSlicelistSizes_slice[sub];
+    const size_t begin = sliceBaseOffset + (size_t)d_prefixFlat_slice[sub];
+    const uint64_t *ptr = d_allSignatures + begin;
+
+    int local = 0;
+    for (size_t t = 0; t < cnt; ++t) {
+        const uint64_t packed = ptr[t];
+        const uint32_t id  = (uint32_t)(packed & 0xFFFFFFFFULL);
+        const uint64_t x = qsig ^ d_offtargets[id];
+        const uint64_t mism = ((x & 0xAAAAAAAAAAAAAAAAULL) >> 1) | (x & 0x5555555555555555ULL);
+        const int dist = __popcll(mism);
+        if (dist <= maxDist) ++local;
+    }
+    d_counts[q] = local;
+}
+
+// Per-slice EMIT kernel: one thread per query, writes hits at offsets[q]..offsets[q+1]-1
+__global__ void k_distance_emit_slice(
+    const uint64_t *__restrict__ d_querySigs, int queryCount,
+    const uint64_t *__restrict__ d_offtargets,
+    const uint64_t *__restrict__ d_allSignatures,
+    const size_t   *__restrict__ d_allSlicelistSizes_slice,
+    const uint32_t *__restrict__ d_prefixFlat_slice,
+    const uint64_t *__restrict__ d_posIdx_slice,
+    int L, size_t sliceBaseOffset, int maxDist,
+    const size_t   *__restrict__ d_offsets,   // Q+1
+    int baseQ,
+    int4 * __restrict__ d_hits,
+    uint64_t * __restrict__ d_mismatches)
+{
+    int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= queryCount) return;
+
+    const uint64_t qsig = d_querySigs[q];
+
+    // Build sub-code
+    uint64_t sub = 0ULL;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        if (j >= L) break;
+        const uint64_t p = d_posIdx_slice[j];
+        sub |= ((qsig >> (p * 2)) & 3ULL) << (j * 2);
+    }
+
+    const size_t cnt   = d_allSlicelistSizes_slice[sub];
+    const size_t begin = sliceBaseOffset + (size_t)d_prefixFlat_slice[sub];
+    const uint64_t *ptr = d_allSignatures + begin;
+
+    size_t out = d_offsets[q];
+    for (size_t t = 0; t < cnt; ++t) {
+        const uint64_t packed = ptr[t];
+        const uint32_t id  = (uint32_t)(packed & 0xFFFFFFFFULL);
+        const uint32_t occ = (uint32_t)(packed >> 32);
+
+        const uint64_t x = qsig ^ d_offtargets[id];
+        const uint64_t mism = ((x & 0xAAAAAAAAAAAAAAAAULL) >> 1) | (x & 0x5555555555555555ULL);
+        const int dist = __popcll(mism);
+        if (dist <= maxDist) {
+            d_hits[out] = make_int4(baseQ + q, (int)id, (int)occ, (int)(mism >> 32));
+            d_mismatches[out] = mism;
+            ++out;
+        }
+    }
+}
+
+void gpu_distance_scan_by_slice_buffered(
+    const std::vector<uint64_t>& querySigs,
+    const std::vector<uint64_t>& offtargets,
+    const std::vector<uint64_t>& allSignatures,   // packed [occ:32|id:32]
+    const std::vector<size_t>&   allSlicelistSizes,
+    const std::vector<int>&      sliceLen,
+    const std::vector<size_t>&   sliceSizesOffset,
+    const std::vector<size_t>&   sliceBaseOffset,
+    const std::vector<uint32_t>& prefixFlat,
+    const std::vector<size_t>&   prefixOffset,
+    const std::vector<uint64_t>& posIdxFlat,
+    const std::vector<size_t>&   posOffset,
+    int maxDist,
+    std::vector<Hit>& out_hits)
+{
+    const int Q = (int)querySigs.size();
+    const size_t N = offtargets.size();
+    (void)N; // unused directly here; kept for clarity
+    const int S = (int)sliceLen.size();
+
+    // Upload static data once
+    uint64_t *d_off=nullptr, *dSig=nullptr, *dPos=nullptr;
+    size_t *dSizes=nullptr, *dSizesOff=nullptr, *dBaseOff=nullptr, *dPrefOff=nullptr, *dPosOff=nullptr;
+    int *dLen=nullptr;
+    uint32_t *dPref=nullptr;
+
+    CUDA_OK(cudaMalloc(&d_off, offtargets.size() * sizeof(uint64_t)));
+    CUDA_OK(cudaMalloc(&dSig, allSignatures.size() * sizeof(uint64_t)));
+    CUDA_OK(cudaMalloc(&dSizes, allSlicelistSizes.size() * sizeof(size_t)));
+    CUDA_OK(cudaMalloc(&dLen, sliceLen.size() * sizeof(int)));
+    CUDA_OK(cudaMalloc(&dSizesOff, sliceSizesOffset.size() * sizeof(size_t)));
+    CUDA_OK(cudaMalloc(&dBaseOff,  sliceBaseOffset.size()  * sizeof(size_t)));
+    CUDA_OK(cudaMalloc(&dPref,     prefixFlat.size()       * sizeof(uint32_t)));
+    CUDA_OK(cudaMalloc(&dPrefOff,  prefixOffset.size()     * sizeof(size_t)));
+    CUDA_OK(cudaMalloc(&dPos,      posIdxFlat.size()       * sizeof(uint64_t)));
+    CUDA_OK(cudaMalloc(&dPosOff,   posOffset.size()        * sizeof(size_t)));
+
+    CUDA_OK(cudaMemcpy(d_off,  offtargets.data(), offtargets.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dSig,   allSignatures.data(), allSignatures.size()*sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dSizes, allSlicelistSizes.data(), allSlicelistSizes.size()*sizeof(size_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dLen,   sliceLen.data(), sliceLen.size()*sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dSizesOff, sliceSizesOffset.data(), sliceSizesOffset.size()*sizeof(size_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dBaseOff,  sliceBaseOffset.data(),  sliceBaseOffset.size() *sizeof(size_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dPref,     prefixFlat.data(),       prefixFlat.size()      *sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dPrefOff,  prefixOffset.data(),     prefixOffset.size()    *sizeof(size_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dPos,      posIdxFlat.data(),       posIdxFlat.size()      *sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dPosOff,   posOffset.data(),        posOffset.size()       *sizeof(size_t), cudaMemcpyHostToDevice));
+
+    // Upload queries once
+    uint64_t* d_q = nullptr;
+    CUDA_OK(cudaMalloc(&d_q, Q * sizeof(uint64_t)));
+    CUDA_OK(cudaMemcpy(d_q, querySigs.data(), Q * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+    out_hits.clear();
+    out_hits.reserve(Q * 128);
+
+    const int threads = 256;
+    const dim3 blk(threads), grd((Q + threads - 1) / threads);
+
+    for (int s = 0; s < S; ++s) {
+        const int   L = sliceLen[s];
+        const size_t sizesBase  = sliceSizesOffset[s];
+        const size_t prefixBase = prefixOffset[s];
+        const size_t baseSigOff = sliceBaseOffset[s];
+        const size_t posBase    = posOffset[s];
+
+        // Slice-local pointers
+        const size_t*   d_sizes_slice   = dSizes + sizesBase;
+        const uint32_t* d_prefix_slice  = dPref  + prefixBase;
+        const uint64_t* d_pos_slice     = dPos   + posBase;
+
+        // PASS 1: count per query
+        thrust::device_vector<int> d_counts(Q, 0);
+        k_distance_count_slice<<<grd, blk>>>(
+            d_q, Q, d_off, dSig,
+            d_sizes_slice, d_prefix_slice,
+            d_pos_slice, L, baseSigOff, maxDist,
+            thrust::raw_pointer_cast(d_counts.data()));
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaGetLastError());
+
+        // Exclusive scan -> offsets (Q+1), compute total
+        thrust::device_vector<size_t> d_offsets(Q + 1);
+        d_offsets[0] = 0;
+        thrust::exclusive_scan(d_counts.begin(), d_counts.end(), d_offsets.begin());
+
+        size_t lastOffset = 0, lastCount = 0;
+        CUDA_OK(cudaMemcpy(&lastOffset,
+                           thrust::raw_pointer_cast(d_offsets.data()) + (Q - 1),
+                           sizeof(size_t), cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(&lastCount,
+                           thrust::raw_pointer_cast(d_counts.data()) + (Q - 1),
+                           sizeof(int), cudaMemcpyDeviceToHost));
+        const size_t totalHits = lastOffset + lastCount;
+
+        // Edge case: no hits for this slice
+        if (totalHits == 0) {
+            // Still set d_offsets[Q] = 0 for completeness
+            size_t zero = 0;
+            CUDA_OK(cudaMemcpy(thrust::raw_pointer_cast(d_offsets.data()) + Q,
+                               &zero, sizeof(size_t), cudaMemcpyHostToDevice));
+            continue;
+        } else {
+            CUDA_OK(cudaMemcpy(thrust::raw_pointer_cast(d_offsets.data()) + Q,
+                               &totalHits, sizeof(size_t), cudaMemcpyHostToDevice));
+        }
+
+        // Allocate exact buffers and EMIT
+        int4* d_hits = nullptr;
+        uint64_t* d_mism = nullptr;
+        CUDA_OK(cudaMalloc(&d_hits, totalHits * sizeof(int4)));
+        CUDA_OK(cudaMalloc(&d_mism, totalHits * sizeof(uint64_t)));
+
+        k_distance_emit_slice<<<grd, blk>>>(
+            d_q, Q, d_off, dSig,
+            d_sizes_slice, d_prefix_slice,
+            d_pos_slice, L, baseSigOff, maxDist,
+            thrust::raw_pointer_cast(d_offsets.data()),
+            /*baseQ*/ 0,
+            d_hits, d_mism);
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaGetLastError());
+
+        // Copy back and append
+        std::vector<int4>      h_hits(totalHits);
+        std::vector<uint64_t>  h_mm(totalHits);
+        CUDA_OK(cudaMemcpy(h_hits.data(), d_hits, totalHits * sizeof(int4), cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(h_mm.data(),   d_mism, totalHits * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+
+        const size_t old = out_hits.size();
+        out_hits.resize(old + totalHits);
+        for (size_t i = 0; i < totalHits; ++i) {
+            out_hits[old + i] = { h_hits[i].x, (uint32_t)h_hits[i].y, (uint32_t)h_hits[i].z, h_mm[i] };
+        }
+
+        CUDA_OK(cudaFree(d_hits));
+        CUDA_OK(cudaFree(d_mism));
+    }
+
+    // Cleanup static
+    CUDA_OK(cudaFree(d_q));
+    CUDA_OK(cudaFree(d_off));
+    CUDA_OK(cudaFree(dSig));
+    CUDA_OK(cudaFree(dSizes));
+    CUDA_OK(cudaFree(dLen));
+    CUDA_OK(cudaFree(dSizesOff));
+    CUDA_OK(cudaFree(dBaseOff));
+    CUDA_OK(cudaFree(dPref));
+    CUDA_OK(cudaFree(dPrefOff));
+    CUDA_OK(cudaFree(dPos));
+    CUDA_OK(cudaFree(dPosOff));
+}
+
 // ======================= 4) Dedup (q,id) and qOffset ========================
 DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
 {
@@ -346,7 +583,7 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
 
     const size_t H = hits.size();
 
-    // ---------- NEW: build on host, single bulk copies to device ----------
+    // Build on host, single bulk copies to device
     host_vector<int>       h_q(H);
     host_vector<uint32_t>  h_id(H), h_occ(H);
     host_vector<uint64_t>  h_mism(H);
@@ -358,11 +595,10 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
         h_mism[i]= hits[i].mismatches;
     }
 
-    device_vector<int>       d_q   = h_q;    // ONE copy
-    device_vector<uint32_t>  d_id  = h_id;   // ONE copy
-    device_vector<uint32_t>  d_occ = h_occ;  // ONE copy
-    device_vector<uint64_t>  d_mism= h_mism; // ONE copy
-    // ----------------------------------------------------------------------
+    device_vector<int>       d_q   = h_q;
+    device_vector<uint32_t>  d_id  = h_id;
+    device_vector<uint32_t>  d_occ = h_occ;
+    device_vector<uint64_t>  d_mism= h_mism;
 
     // sort by (q,id)
     auto keys_begin = make_zip_iterator(make_tuple(d_q.begin(), d_id.begin()));
@@ -387,7 +623,7 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
     size_t U = new_end.first - out_keys_begin;
     q_u.resize(U); id_u.resize(U); occ_u.resize(U); mism_u.resize(U);
 
-    // ----- Build qOffset (dense, size Q+1) -----
+    // Build qOffset (dense, size Q+1)
     device_vector<int> q_unique(U);
     device_vector<int> q_counts_compact(U);
     auto end_counts = thrust::reduce_by_key(
@@ -407,7 +643,7 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
     qOffset[0] = 0;
     thrust::inclusive_scan(q_counts.begin(), q_counts.end(), qOffset.begin() + 1);
 
-    // ----- Distinct IDs across ALL queries -----
+    // Distinct IDs across ALL queries
     device_vector<uint32_t> id_copy = id_u;
     thrust::sort(id_copy.begin(), id_copy.end());
     auto id_end = thrust::unique(id_copy.begin(), id_copy.end());
