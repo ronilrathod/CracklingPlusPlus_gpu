@@ -246,7 +246,7 @@ void gpu_distance_scan_flat(
     CUDA_OK(cudaMemcpy(dPos, posIdxFlat.data(), posIdxFlat.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(dPosOff, posOffset.data(), posOffset.size() * sizeof(size_t), cudaMemcpyHostToDevice));
 
-    const int BATCH = 2000; // tune to your GPU
+    const int BATCH = 10000; // 4070 Ti has plenty of SMs
     out_hits.clear();
     out_hits.reserve(Q * 64);
 
@@ -329,12 +329,12 @@ void gpu_distance_scan_flat(
 DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
 {
     using thrust::device_vector;
+    using thrust::host_vector;
     using thrust::make_tuple;
     using thrust::make_zip_iterator;
 
     DedupResult res;
-    if (hits.empty())
-    {
+    if (hits.empty()) {
         res.q_u.clear();
         res.id_u.clear();
         res.occ_u.clear();
@@ -345,30 +345,36 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
     }
 
     const size_t H = hits.size();
-    device_vector<int> d_q(H);
-    device_vector<uint32_t> d_id(H), d_occ(H);
-    device_vector<uint64_t> d_mism(H);
 
-    // copy in (host -> device)
-    for (size_t i = 0; i < H; ++i)
-    {
-        d_q[i] = hits[i].q;
-        d_id[i] = hits[i].id;
-        d_occ[i] = hits[i].occ;
-        d_mism[i] = hits[i].mismatches;
+    // ---------- NEW: build on host, single bulk copies to device ----------
+    host_vector<int>       h_q(H);
+    host_vector<uint32_t>  h_id(H), h_occ(H);
+    host_vector<uint64_t>  h_mism(H);
+
+    for (size_t i = 0; i < H; ++i) {
+        h_q[i]   = hits[i].q;
+        h_id[i]  = hits[i].id;
+        h_occ[i] = hits[i].occ;
+        h_mism[i]= hits[i].mismatches;
     }
+
+    device_vector<int>       d_q   = h_q;    // ONE copy
+    device_vector<uint32_t>  d_id  = h_id;   // ONE copy
+    device_vector<uint32_t>  d_occ = h_occ;  // ONE copy
+    device_vector<uint64_t>  d_mism= h_mism; // ONE copy
+    // ----------------------------------------------------------------------
 
     // sort by (q,id)
     auto keys_begin = make_zip_iterator(make_tuple(d_q.begin(), d_id.begin()));
-    auto keys_end = make_zip_iterator(make_tuple(d_q.end(), d_id.end()));
+    auto keys_end   = make_zip_iterator(make_tuple(d_q.end(),   d_id.end()));
     auto vals_begin = make_zip_iterator(make_tuple(d_occ.begin(), d_mism.begin()));
     thrust::sort_by_key(keys_begin, keys_end, vals_begin);
 
-    // reduce_by_key to dedup (q,id), keep FIRST (no sum) via OccPlusKeepMism
-    device_vector<int> q_u(d_q.size());
-    device_vector<uint32_t> id_u(d_id.size());
-    device_vector<uint32_t> occ_u(d_occ.size());
-    device_vector<uint64_t> mism_u(d_mism.size());
+    // reduce_by_key to dedup (q,id), keep FIRST (parity with CPU)
+    device_vector<int>       q_u(d_q.size());
+    device_vector<uint32_t>  id_u(d_id.size());
+    device_vector<uint32_t>  occ_u(d_occ.size());
+    device_vector<uint64_t>  mism_u(d_mism.size());
 
     auto out_keys_begin = make_zip_iterator(make_tuple(q_u.begin(), id_u.begin()));
     auto out_vals_begin = make_zip_iterator(make_tuple(occ_u.begin(), mism_u.begin()));
@@ -379,13 +385,9 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
         KeyEqQid{}, OccPlusKeepMism{});
 
     size_t U = new_end.first - out_keys_begin;
-    q_u.resize(U);
-    id_u.resize(U);
-    occ_u.resize(U);
-    mism_u.resize(U);
+    q_u.resize(U); id_u.resize(U); occ_u.resize(U); mism_u.resize(U);
 
     // ----- Build qOffset (dense, size Q+1) -----
-    // 1) count hits per unique q
     device_vector<int> q_unique(U);
     device_vector<int> q_counts_compact(U);
     auto end_counts = thrust::reduce_by_key(
@@ -397,12 +399,10 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
     q_unique.resize(K);
     q_counts_compact.resize(K);
 
-    // 2) scatter to dense histogram [0..Q-1]
     device_vector<int> q_counts(Q, 0);
     thrust::scatter(q_counts_compact.begin(), q_counts_compact.end(),
                     q_unique.begin(), q_counts.begin());
 
-    // 3) exclusive scan -> offsets
     device_vector<size_t> qOffset(Q + 1);
     qOffset[0] = 0;
     thrust::inclusive_scan(q_counts.begin(), q_counts.end(), qOffset.begin() + 1);
@@ -414,16 +414,11 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
     uint64_t distinct = static_cast<uint64_t>(id_end - id_copy.begin());
 
     // copy out to host
-    res.q_u.resize(U);
-    thrust::copy(q_u.begin(), q_u.end(), res.q_u.begin());
-    res.id_u.resize(U);
-    thrust::copy(id_u.begin(), id_u.end(), res.id_u.begin());
-    res.occ_u.resize(U);
-    thrust::copy(occ_u.begin(), occ_u.end(), res.occ_u.begin());
-    res.mism_u.resize(U);
-    thrust::copy(mism_u.begin(), mism_u.end(), res.mism_u.begin());
-    res.qOffset.resize(Q + 1);
-    thrust::copy(qOffset.begin(), qOffset.end(), res.qOffset.begin());
+    res.q_u.resize(U);        thrust::copy(q_u.begin(),     q_u.end(),     res.q_u.begin());
+    res.id_u.resize(U);       thrust::copy(id_u.begin(),    id_u.end(),    res.id_u.begin());
+    res.occ_u.resize(U);      thrust::copy(occ_u.begin(),   occ_u.end(),   res.occ_u.begin());
+    res.mism_u.resize(U);     thrust::copy(mism_u.begin(),  mism_u.end(),  res.mism_u.begin());
+    res.qOffset.resize(Q + 1);thrust::copy(qOffset.begin(), qOffset.end(), res.qOffset.begin());
     res.distinctCount = distinct;
 
     return res;
