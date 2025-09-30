@@ -18,7 +18,7 @@
 #include <stdexcept>
 #include <cstdio>
 
-// ---- CUDA error check ------------------------------------------------------
+//  CUDA error check 
 #define CUDA_OK(stmt)                                                        \
     do                                                                       \
     {                                                                        \
@@ -57,7 +57,7 @@ struct OccPlusKeepMism
     }
 };
 
-// --------------------------- 1) popcount sanity ----------------------------
+//  1) popcount sanity 
 __global__ void k_hamming(const uint64_t *a, const uint64_t *b, int *out, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -84,7 +84,7 @@ void gpu_popcount_hamming(const uint64_t *h_a, const uint64_t *h_b, int n, int *
     CUDA_OK(cudaFree(d_out));
 }
 
-// --------------------------- 2) encoder -----------------------------------
+// 2) encoder 
 __device__ __forceinline__ uint8_t nuc_lut(char c)
 {
     // CPU mapping: A=0, C=1, G=2, T=3; everything else 0
@@ -127,7 +127,7 @@ void gpu_encode_sequences(const char *h_buf, int n, int stride, int seqlen, uint
     CUDA_OK(cudaFree(d_out));
 }
 
-// ---------------------- 3) distance scan (old atomic version; kept intact) -
+// 3) distance scan (old atomic version; kept intact) -
 __global__ void k_distance_scan(
     const uint64_t *__restrict__ d_querySigs, int queryCount,
     const uint64_t *__restrict__ d_offtargets,
@@ -318,7 +318,7 @@ void gpu_distance_scan_flat(
     CUDA_OK(cudaFree(dPosOff));
 }
 
-// ---------------------- 3b) NEW distance scan: by-slice, no atomics --------
+// 3b) NEW distance scan: by-slice, no atomics
 // Per-slice COUNT kernel: one thread per query, returns hits per query (for this slice)
 __global__ void k_distance_count_slice(
     const uint64_t *__restrict__ d_querySigs, int queryCount,
@@ -562,7 +562,7 @@ void gpu_distance_scan_by_slice_buffered(
     CUDA_OK(cudaFree(dPosOff));
 }
 
-// ======================= 4) Dedup (q,id) and qOffset ========================
+// 4) Dedup (q,id) and qOffset 
 DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
 {
     using thrust::device_vector;
@@ -660,9 +660,9 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
     return res;
 }
 
-// ======================= 5) Scoring kernel & wrappers =======================
+// 5) Scoring kernel & wrappers
 __constant__ double d_cfdPam[16];
-__constant__ double d_cfdPos[/* 20*16 or more; we will load exact size at runtime */ 1024]; // large enough guard
+__constant__ double d_cfdPos[/* 20*16 or more; will load exact size at runtime */ 1024]; // large enough guard
 
 void gpu_load_cfd_tables(const double *pam, size_t pamSize, const double *pos, size_t posSize)
 {

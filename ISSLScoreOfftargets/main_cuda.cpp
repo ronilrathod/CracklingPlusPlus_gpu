@@ -16,7 +16,7 @@
 #include "issl_cuda.cuh"                   // Hit, gpu_encode_sequences(...), gpu_distance_scan_flat(...), gpu_dedup_by_qid(...), gpu_score_queries(...), gpu_load_cfd_tables(...)
 #include "../include/otScorePenalties.hpp" // cfdPamPenalties, cfdPosPenalties, precalculatedMITScores
 
-// --- tiny helpers (no Boost) ------------------------------------------------
+// tiny helpers
 static inline std::string signatureToSequence(uint64_t sig, int seqLen)
 {
     static const char LUT[4] = {'A', 'C', 'G', 'T'};
@@ -50,7 +50,6 @@ static inline int toScoreMethodEnum(const std::string &m)
     return -1;
 }
 
-// ----------------------------------------------------------------------------
 
 int main(int argc, char **argv)
 {
@@ -96,9 +95,7 @@ int main(int argc, char **argv)
         calcCfd = true;
     }
 
-    // ---------------------------
     // 1) LOAD ISSL INDEX (CPU)
-    // ---------------------------
     auto t_total_start = std::chrono::high_resolution_clock::now();
     auto t_load_start = t_total_start;
 
@@ -178,9 +175,7 @@ int main(int argc, char **argv)
     }
     std::fclose(isslFp);
 
-    // ---------------------------------------------
     // 2) PACK FLAT ARRAYS for the GPU distance scan
-    // ---------------------------------------------
     std::vector<int> h_sliceLen(sliceCount);
     std::vector<size_t> h_sliceSizesOffset(sliceCount); // index into allSlicelistSizes for this slice
     std::vector<size_t> h_sliceBaseOffset(sliceCount);  // base offset (in elements) into allSignatures for this slice
@@ -226,9 +221,8 @@ int main(int argc, char **argv)
 
     auto t_load_end = std::chrono::high_resolution_clock::now();
 
-    // ---------------------------
     // 3) LOAD QUERIES (CPU)
-    // ---------------------------
+
     auto t_query_start = std::chrono::high_resolution_clock::now();
 
     size_t seqLineLength = seqLength + 1; // 20 + '\n'
@@ -256,9 +250,9 @@ int main(int argc, char **argv)
     std::fclose(qfp);
 
     auto t_query_end = std::chrono::high_resolution_clock::now();
-    // ---------------------------
+
     // 4) GPU ENCODE (replace omp1)
-    // ---------------------------
+
     std::vector<uint64_t> querySignatures(queryCount);
     auto t_enc0 = std::chrono::high_resolution_clock::now();
     gpu_encode_sequences(queryDataSet.data(), queryCount, (int)seqLineLength, (int)seqLength, querySignatures.data());
@@ -266,7 +260,7 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "GPU encode done: %d guides in %.3f ms\n",
                  queryCount, std::chrono::duration<double, std::milli>(t_enc1 - t_enc0).count());
 
-    // ---- Parity sanity (optional) ----
+    // Parity sanity
     size_t mismatches = 0;
     auto cpu_encode_line = [seqLength](const char *s) -> uint64_t
     {
@@ -297,9 +291,8 @@ int main(int argc, char **argv)
     }
     std::fprintf(stderr, "Encode parity: %zu mismatches out of %d\n", mismatches, queryCount);
 
-    // ---------------------------
-    // 5) GPU distance scan
-    // ---------------------------
+
+    // 5) GPU distance scan (by-slice buffered, no atomics)
     auto t_scan0 = std::chrono::high_resolution_clock::now();
     std::vector<Hit> hits;
     gpu_distance_scan_by_slice_buffered(
@@ -312,16 +305,13 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "GPU distance hits: %zu (scan %.3f ms)\n",
                  hits.size(), std::chrono::duration<double, std::milli>(t_scan1 - t_scan0).count());
 
-    // ---------------------------
     // 6) GPU dedup (q,id) + per-query offsets + distinct IDs
-    // ---------------------------
     auto t_dedup0 = std::chrono::high_resolution_clock::now();
     DedupResult dd = gpu_dedup_by_qid(hits, queryCount);
     auto t_dedup1 = std::chrono::high_resolution_clock::now();
 
-    // ---------------------------
-    // 7) Build MIT LUT on host (exact CPU parity)
-    // ---------------------------
+
+    // 7) Build MIT look-up table on host (exact CPU parity)
     auto t_lut0 = std::chrono::high_resolution_clock::now();
     std::vector<uint64_t> mitMasks = dd.mism_u;
     std::sort(mitMasks.begin(), mitMasks.end());
@@ -338,15 +328,11 @@ int main(int argc, char **argv)
     }
     auto t_lut1 = std::chrono::high_resolution_clock::now();
 
-    // ---------------------------
     // 8) Load CFD tables to GPU constant memory
-    // ---------------------------
     gpu_load_cfd_tables(cfdPamPenalties, sizeof(cfdPamPenalties) / sizeof(double),
                         cfdPosPenalties, sizeof(cfdPosPenalties) / sizeof(double));
 
-    // ---------------------------
     // 9) GPU scoring (per-query block; early-exit parity)
-    // ---------------------------
     auto t_score0 = std::chrono::high_resolution_clock::now();
     std::vector<double> querySignatureMitScores(queryCount, 0.0);
     std::vector<double> querySignatureCfdScores(queryCount, 0.0);
@@ -364,14 +350,12 @@ int main(int argc, char **argv)
     // Distinct off-targets across all queries (from dedup result)
     uint64_t distinctOfftargets = dd.distinctCount;
 
-    // ---------------------------
     // 10) Write results like CPU (but under results\gpu\)
-    // ---------------------------
     auto t_out0 = std::chrono::high_resolution_clock::now();
 
     std::filesystem::create_directories(".\\results\\gpu");
     std::string outName = wantOutputName ? std::string(argv[6]) : "gpu_results.txt";
-    std::string outPath = ".\\results\\gpu\\" + outName;
+    std::string outPath = ".\\results\\gpu_final\\" + outName;
 
     FILE *out = std::fopen(outPath.c_str(), "w");
     if (!out)
@@ -402,9 +386,8 @@ int main(int argc, char **argv)
     auto t_out1 = std::chrono::high_resolution_clock::now();
     auto t_total_end = std::chrono::high_resolution_clock::now();
 
-    // ---------------------------
+
     // 11) Print CPU-style summary
-    // ---------------------------
     const auto ms_load = std::chrono::duration_cast<std::chrono::milliseconds>(t_load_end - t_load_start).count();
     const auto ms_query = std::chrono::duration_cast<std::chrono::milliseconds>(t_query_end - t_query_start).count();
     const auto ms_encode = std::chrono::duration_cast<std::chrono::milliseconds>(t_enc1 - t_enc0).count();
