@@ -137,7 +137,71 @@ To run the program simply fill out the provided `config.ini` in the samples fold
 CracklingPlusPlus <config-file>
 ```
 
+## CUDA GPU Acceleration
 
+CracklingPlusPlus includes CUDA support for GPU-accelerated off-target scoring. This provides significant performance improvements for large-scale analyses.
+
+### Prerequisites
+- NVIDIA GPU with CUDA Compute Capability 7.0 or higher
+- NVIDIA CUDA Toolkit installed
+- NVIDIA drivers installed
+- Visual Studio 2022 with x64 Native Tools Command Prompt
+
+### Compiling CUDA Version
+
+To compile the CUDA version, use the x64 Native Tools Command Prompt for VS 2022 and run:
+
+```cmd
+nvcc -arch=sm_89 -std=c++17 ^
+  ISSLScoreOfftargets\issl_cuda.cu ^
+  ISSLScoreOfftargets\main_cuda.cpp ^
+  lib\otScorePenalties.cpp ^
+  -I ISSLScoreOfftargets -I include ^
+  -Xcompiler "/O2 /MD /EHsc /DNOMINMAX /std:c++17" ^
+  -Xlinker "/NODEFAULTLIB:LIBCMT" ^
+  -o build\ISSLScoreOfftargets\Release\ISSLScoreOfftargetsCUDA.exe
+```
+
+Note: Adjust the `-arch=sm_89` parameter based on your GPU's compute capability. Common values include:
+- `sm_75` for RTX 20 series
+- `sm_80` for RTX 30 series  
+- `sm_89` for RTX 40 series
+
+### Running CUDA Version
+
+The CUDA executable will be created as `ISSLScoreOfftargetsCUDA.exe` in the build directory. Usage:
+
+```cmd
+.\ISSLScoreOfftargets\Release\ISSLScoreOfftargetsCUDA.exe <issl-index> <guides-file> <slice-config> <penalty-mode> <output-prefix> [log-file]
+```
+
+**Arguments:**
+- `issl-index`: Path to the ISSL index file
+- `guides-file`: Path to the guides file
+- `slice-config`: Slice configuration number (e.g., 4)
+- `penalty-mode`: Penalty mode (e.g., 0)
+- `output-prefix`: Prefix for output files
+- `log-file`: Optional log file (redirect stderr)
+
+**Examples:**
+
+For a test run:
+```cmd
+.\ISSLScoreOfftargets\Release\ISSLScoreOfftargetsCUDA.exe `
+".\data\genomes\Panicgrass_indexed.issl" `
+".\data\genomes\guides_fixed.txt" `         
+4 0 mit panicgrass_run_gpu_test `
+2> ".\results\gpu\panicgrass_gpu_test.log"
+```
+
+For a full analysis:
+```cmd
+.\ISSLScoreOfftargets\Release\ISSLScoreOfftargetsCUDA.exe `
+".\data\genomes\3Bakeryeast_indexed.issl" `
+".\data\genomes\3Bakeryeast_offtargets.txt" `
+4 0 mit baker_run_gpu_new `        
+2> ".\results\gpu\baker_gpu_new.log"
+```
 
 ## References
 
