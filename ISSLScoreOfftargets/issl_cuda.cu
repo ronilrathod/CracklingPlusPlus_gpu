@@ -57,7 +57,7 @@ struct OccPlusKeepMism
     }
 };
 
-// ==================== SEQUENCE ENCODING ====================
+// SEQUENCE ENCODING 
 // Convert DNA sequences to 64-bit signatures for efficient comparison
 
 // Nucleotide lookup table: A=0, C=1, G=2, T=3, others=0
@@ -104,7 +104,7 @@ void gpu_encode_sequences(const char *h_buf, int n, int stride, int seqlen, uint
     CUDA_OK(cudaFree(d_out));
 }
 
-// ==================== DISTANCE SCANNING ====================
+// DISTANCE SCANNING 
 // Find off-targets within maximum distance using slice-based approach
 // Count hits per query for a single slice (first pass)
 __global__ void k_distance_count_slice(
@@ -349,7 +349,7 @@ void gpu_distance_scan_by_slice_buffered(
     CUDA_OK(cudaFree(dPosOff));
 }
 
-// ==================== DEDUPLICATION ====================
+// DEDUPLICATION 
 // Remove duplicate (query, off-target) pairs and build query offsets
 
 DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
@@ -449,7 +449,7 @@ DedupResult gpu_dedup_by_qid(const std::vector<Hit> &hits, int Q)
     return res;
 }
 
-// ==================== SCORING ====================
+// SCORING 
 // Calculate MIT and CFD scores for off-targets
 
 // CFD penalty tables stored in constant memory for fast access

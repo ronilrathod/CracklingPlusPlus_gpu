@@ -5,8 +5,7 @@
 #include <vector>
 #include <string>
 
-// ==================== DATA STRUCTURES ====================
-
+// DATA STRUCTURES 
 // Hit structure returned by GPU distance stage
 struct Hit
 {
@@ -26,8 +25,7 @@ struct DedupResult {
     uint64_t               distinctCount; // unique IDs across all queries
 };
 
-// ==================== FUNCTION DECLARATIONS ====================
-
+// FUNCTION DECLARATIONS 
 // GPU sequence encoding: convert DNA sequences to 64-bit signatures
 void gpu_encode_sequences(const char *h_buf, int n, int seqLineLength, int seqLen, uint64_t *h_out);
 

@@ -17,7 +17,7 @@
 #include "issl_cuda.cuh"                   // GPU functions and data structures
 #include "../include/otScorePenalties.hpp" // CFD and MIT penalty tables
 
-// ==================== UTILITY FUNCTIONS ====================
+//  UTILITY FUNCTIONS
 
 // Convert 64-bit signature back to DNA sequence string
 static inline std::string signatureToSequence(uint64_t sig, int seqLen)
@@ -50,7 +50,7 @@ static inline int toScoreMethodEnum(const std::string &m)
 }
 
 
-// ==================== MAIN PROGRAM ====================
+// MAIN PROGRAM 
 
 int main(int argc, char **argv)
 {
@@ -97,7 +97,7 @@ int main(int argc, char **argv)
         calcCfd = true;
     }
 
-    // ==================== STEP 1: LOAD ISSL INDEX ====================
+    // LOAD ISSL INDEX 
     auto t_total_start = std::chrono::high_resolution_clock::now();
     auto t_load_start = t_total_start;
 
@@ -177,7 +177,7 @@ int main(int argc, char **argv)
     }
     std::fclose(isslFp);
 
-    // ==================== STEP 2: PREPARE DATA FOR GPU ====================
+    // PREPARE DATA FOR GPU 
     std::vector<int> h_sliceLen(sliceCount);
     std::vector<size_t> h_sliceSizesOffset(sliceCount); // index into allSlicelistSizes for this slice
     std::vector<size_t> h_sliceBaseOffset(sliceCount);  // base offset (in elements) into allSignatures for this slice
@@ -223,7 +223,7 @@ int main(int argc, char **argv)
 
     auto t_load_end = std::chrono::high_resolution_clock::now();
 
-    // ==================== STEP 3: LOAD QUERY SEQUENCES ====================
+    // LOAD QUERY SEQUENCES 
     auto t_query_start = std::chrono::high_resolution_clock::now();
 
     size_t seqLineLength = seqLength + 1; // 20 + '\n'
@@ -252,7 +252,7 @@ int main(int argc, char **argv)
 
     auto t_query_end = std::chrono::high_resolution_clock::now();
 
-    // ==================== STEP 4: GPU SEQUENCE ENCODING ====================
+    // GPU SEQUENCE ENCODING 
     std::vector<uint64_t> querySignatures(queryCount);
     auto t_enc0 = std::chrono::high_resolution_clock::now();
     gpu_encode_sequences(queryDataSet.data(), queryCount, (int)seqLineLength, (int)seqLength, querySignatures.data());
@@ -287,7 +287,7 @@ int main(int argc, char **argv)
     }
     std::fprintf(stderr, "Encode parity: %zu mismatches out of %d\n", mismatches, queryCount);
 
-    // ==================== STEP 5: GPU DISTANCE SCANNING ====================
+    // GPU DISTANCE SCANNING 
     auto t_scan0 = std::chrono::high_resolution_clock::now();
     std::vector<Hit> hits;
     gpu_distance_scan_by_slice_buffered(
@@ -300,13 +300,13 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "GPU distance hits: %zu (scan %.3f ms)\n",
                  hits.size(), std::chrono::duration<double, std::milli>(t_scan1 - t_scan0).count());
 
-    // ==================== STEP 6: GPU DEDUPLICATION ====================
+    // GPU DEDUPLICATION 
     auto t_dedup0 = std::chrono::high_resolution_clock::now();
     DedupResult dd = gpu_dedup_by_qid(hits, queryCount);
     auto t_dedup1 = std::chrono::high_resolution_clock::now();
 
 
-    // ==================== STEP 7: BUILD MIT LOOKUP TABLE ====================
+    // BUILD MIT LOOKUP TABLE 
     auto t_lut0 = std::chrono::high_resolution_clock::now();
     std::vector<uint64_t> mitMasks = dd.mism_u;
     std::sort(mitMasks.begin(), mitMasks.end());
@@ -323,11 +323,11 @@ int main(int argc, char **argv)
     }
     auto t_lut1 = std::chrono::high_resolution_clock::now();
 
-    // ==================== STEP 8: LOAD CFD TABLES TO GPU ====================
+    // LOAD CFD TABLES TO GPU 
     gpu_load_cfd_tables(cfdPamPenalties, sizeof(cfdPamPenalties) / sizeof(double),
                         cfdPosPenalties, sizeof(cfdPosPenalties) / sizeof(double));
 
-    // ==================== STEP 9: GPU SCORING ====================
+    // GPU SCORING 
     auto t_score0 = std::chrono::high_resolution_clock::now();
     std::vector<double> querySignatureMitScores(queryCount, 0.0);
     std::vector<double> querySignatureCfdScores(queryCount, 0.0);
@@ -345,7 +345,7 @@ int main(int argc, char **argv)
     // Distinct off-targets across all queries (from dedup result)
     uint64_t distinctOfftargets = dd.distinctCount;
 
-    // ==================== STEP 10: WRITE RESULTS ====================
+    // WRITE RESULTS 
     auto t_out0 = std::chrono::high_resolution_clock::now();
 
     std::filesystem::create_directories(".\\results\\gpu");
@@ -382,7 +382,7 @@ int main(int argc, char **argv)
     auto t_total_end = std::chrono::high_resolution_clock::now();
 
 
-    // ==================== STEP 11: PRINT SUMMARY ====================
+    // PRINT SUMMARY 
     const auto ms_load = std::chrono::duration_cast<std::chrono::milliseconds>(t_load_end - t_load_start).count();
     const auto ms_query = std::chrono::duration_cast<std::chrono::milliseconds>(t_query_end - t_query_start).count();
     const auto ms_encode = std::chrono::duration_cast<std::chrono::milliseconds>(t_enc1 - t_enc0).count();
